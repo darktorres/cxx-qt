@@ -29,9 +29,13 @@ impl QtToolQmlTypeRegistrar {
     }
 
     /// Run [qmltyperegistrar](https://www.qt.io/blog/qml-type-registration-in-qt-5.15)
+    ///
+    /// photo-gallery (vendor/README.md): `foreign_types` are other modules' metatypes files (Qt's),
+    /// consulted for the types that `metatypes_json`'s reference.
     pub fn compile(
         &self,
         metatypes_json: &[impl AsRef<Path>],
+        foreign_types: &[PathBuf],
         qmltypes: impl AsRef<Path>,
         uri: &QmlUri,
         version: Version,
@@ -72,6 +76,16 @@ impl QtToolQmlTypeRegistrar {
             "-o".to_owned(),
             qmltyperegistrar_output_path.to_string_lossy().into_owned(),
         ];
+        if !foreign_types.is_empty() {
+            args.push("--foreign-types".to_owned());
+            args.push(
+                foreign_types
+                    .iter()
+                    .map(|path| path.to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+        }
         args.extend(metatypes_json);
         let cmd = Command::new(&self.executable)
             .args(args)

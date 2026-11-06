@@ -373,6 +373,34 @@ impl QtBuild {
                 .expect("Could note write qrc file");
         }
 
+        // photo-gallery (vendor/README.md): run qmltyperegistrar before qmlcachegen, which reads the
+        // .qmltypes it writes to know the module's C++ types; afterwards, qmlcachegen saw the previous
+        // build's (or, in a clean build, none). And consult Qt's own metatypes for the types those
+        // reference (QString, QUrl, QAbstractListModel, ...), as Qt's CMake does: without them,
+        // qmltyperegistrar declares each as an opaque type of this module, which hides the real one.
+        let qmltyperegistrar_path = self.qmltyperegistrar().compile(
+            metatypes_json,
+            &self.qt_metatypes(),
+            &qmltypes_path,
+            uri,
+            Version::new(version_major as u64, version_minor as u64, 0),
+        );
+
+        // photo-gallery (vendor/README.md): lay the QML files out beside the qmldir, which lists
+        // them by their paths relative to it, as Qt's CMake does. qmlcachegen finds the module's
+        // own components through the qmldir: without the files, none is known to it.
+        for file in qml_files {
+            let path = file.get_path();
+            if path.is_relative() {
+                let copy = qml_module_dir.join(path);
+                std::fs::create_dir_all(copy.parent().expect("QML file to have a parent"))
+                    .expect("Could not create directory for QML file");
+                std::fs::copy(path, &copy).unwrap_or_else(|_| {
+                    panic!("Could not copy {} into the QML module", path.display())
+                });
+            }
+        }
+
         // Run qmlcachegen
         // qmlcachegen needs to be run once for each .qml file with --resource-path,
         // then once for the module with --resource-name.
@@ -404,14 +432,6 @@ impl QtBuild {
 
         let qml_plugin_dir = PathBuf::from(format!("{out_dir}/qt-build-utils/qml_plugin"));
         std::fs::create_dir_all(&qml_plugin_dir).expect("Could not create qml_plugin dir");
-
-        // Run qmltyperegistrar over the meta types
-        let qmltyperegistrar_path = self.qmltyperegistrar().compile(
-            metatypes_json,
-            &qmltypes_path,
-            uri,
-            Version::new(version_major as u64, version_minor as u64, 0),
-        );
 
         // Generate QQmlEngineExtensionPlugin
         let qml_plugin_cpp_path = qml_plugin_dir.join(format!("{plugin_class_name}.cpp"));
@@ -469,5 +489,37 @@ impl QtBuild {
     /// Create a [QtToolQtPaths] for this [QtBuild]
     pub fn qtpaths(&self) -> QtToolQtPaths {
         QtToolQtPaths::new(self.qt_installation.as_ref())
+    }
+
+    /// photo-gallery (vendor/README.md): the metatypes files of the Qt installation's modules, for
+    /// qmltyperegistrar's --foreign-types: in QT_INSTALL_ARCHDATA/metatypes (QT_INSTALL_LIBS/metatypes
+    /// before Qt 6.5). All of them rather than the linked modules' and their dependencies', which
+    /// Qt's CMake knows and this doesn't: they are only consulted for the types referenced.
+    fn qt_metatypes(&self) -> Vec<PathBuf> {
+        if self.qt_installation.version().major < 6 {
+            return Vec::new();
+        }
+        let qtpaths = self.qtpaths();
+        let Some(dir) = ["QT_INSTALL_ARCHDATA", "QT_INSTALL_LIBS"]
+            .into_iter()
+            .filter_map(|query| qtpaths.query(query))
+            .filter(|path| !path.is_empty())
+            .map(|path| PathBuf::from(path).join("metatypes"))
+            .find(|dir| dir.is_dir())
+        else {
+            return Vec::new();
+        };
+        let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|_| panic!("Could not list {}", dir.display()))
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(OsStr::to_str)
+                    .is_some_and(|name| name.ends_with("_metatypes.json"))
+            })
+            .collect();
+        files.sort();
+        files
     }
 }
