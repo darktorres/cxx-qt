@@ -270,6 +270,7 @@ fn generate_cxxqt_cpp_files(
     rs_source: &[impl AsRef<Path>],
     header_dir: impl AsRef<Path>,
     include_prefix: &str,
+    rerun: bool,
 ) -> Vec<GeneratedCppFilePaths> {
     let cxx_qt_dir = dir::gen();
     std::fs::create_dir_all(&cxx_qt_dir).expect("Failed to create cxx-qt-gen directory!");
@@ -281,7 +282,9 @@ fn generate_cxxqt_cpp_files(
     let mut generated_file_paths: Vec<GeneratedCppFilePaths> = Vec::with_capacity(rs_source.len());
     for rs_path in rs_source {
         let path = manifest_dir.join(rs_path);
-        println!("cargo::rerun-if-changed={}", path.display());
+        if rerun {
+            println!("cargo::rerun-if-changed={}", path.display());
+        }
 
         let generated_code = match GeneratedCpp::new(&path, rs_path, include_prefix) {
             Ok(v) => v,
@@ -370,6 +373,8 @@ pub struct CxxQtBuilder {
     include_prefix: String,
     crate_include_root: Option<String>,
     additional_include_dirs: Vec<PathBuf>,
+    /// The content key of content_key_env, when set: the build then reruns on the key, not on the mtimes of the sources.
+    content_key: Option<String>,
 }
 
 impl CxxQtBuilder {
@@ -412,6 +417,7 @@ impl CxxQtBuilder {
             include_prefix: crate_name(),
             crate_include_root: Some(String::new()),
             additional_include_dirs: vec![],
+            content_key: None,
         }
     }
 
@@ -439,6 +445,29 @@ impl CxxQtBuilder {
         builder.qt_module("Qml")
     }
 
+    /// Rebuild on the content of a key instead of on the mtimes of the sources.
+    ///
+    /// Cargo reruns a build script when any file it lists in `cargo::rerun-if-changed` is newer than its last run. A fresh
+    /// checkout makes every file newer, so every build script that lists the sources reruns on every CI run. With this, the
+    /// key is the value of the environment variable `env_var`, and the build script reruns only when that value changes
+    /// (`cargo::rerun-if-env-changed`). CI sets it to a hash of the crate's inputs, so it changes exactly when they do.
+    /// Unset or empty, the path lines are emitted as before, so local builds are unchanged.
+    ///
+    /// Call it first in the chain, before `files`, `initializer`, `qrc`, `qrc_resources` and `cpp_files`: those emit
+    /// their lines when they are called.
+    pub fn content_key_env(mut self, env_var: &str) -> Self {
+        println!("cargo::rerun-if-env-changed={env_var}");
+        self.content_key = env::var(env_var).ok().filter(|key| !key.is_empty());
+        self
+    }
+
+    /// Emit `cargo::rerun-if-changed` for a path, unless the content key replaces the path lines.
+    fn rerun_if_changed(&self, path: &Path) {
+        if self.content_key.is_none() {
+            println!("cargo::rerun-if-changed={}", path.display());
+        }
+    }
+
     /// Specify rust file paths to parse through the cxx-qt macro
     /// Relative paths are treated as relative to the path of your crate's Cargo.toml file
     pub fn file(self, rust_source: impl AsRef<Path>) -> Self {
@@ -456,7 +485,7 @@ impl CxxQtBuilder {
         let (old_sources, new_sources) = self.rust_sources.split_at(len);
 
         for source in new_sources {
-            println!("cargo::rerun-if-changed={}", source.display());
+            self.rerun_if_changed(source);
             if old_sources.contains(source) {
                 // Duplicate rust files are likely to cause confusing linker errors later on
                 // Warn the user about it so that debugging may be easier.
@@ -472,7 +501,7 @@ impl CxxQtBuilder {
     #[doc(hidden)]
     pub fn initializer(mut self, initializer: qt_build_utils::Initializer) -> Self {
         if let Some(ref init_file) = initializer.file {
-            println!("cargo::rerun-if-changed={}", init_file.display());
+            self.rerun_if_changed(init_file);
         }
         self.init_files.push(initializer);
         self
@@ -543,7 +572,7 @@ impl CxxQtBuilder {
     pub fn qrc(mut self, qrc_file: impl AsRef<Path>) -> Self {
         let qrc_file = qrc_file.as_ref();
         self.qrc_files.push(qrc_file.to_path_buf());
-        println!("cargo::rerun-if-changed={}", qrc_file.display());
+        self.rerun_if_changed(qrc_file);
         self
     }
 
@@ -583,7 +612,7 @@ impl CxxQtBuilder {
             .get_resources()
             .flat_map(|resource| resource.get_files())
         {
-            println!("cargo::rerun-if-changed={}", file.get_path().display());
+            self.rerun_if_changed(file.get_path());
         }
 
         self.qrc_resources.push(qrc_resources);
@@ -642,7 +671,7 @@ impl CxxQtBuilder {
         let len = self.cpp_files.len();
         self.cpp_files.extend(files.into_iter().map(Into::into));
         for new_file in &self.cpp_files[len..] {
-            println!("cargo::rerun-if-changed={}", new_file.path.display());
+            self.rerun_if_changed(&new_file.path);
         }
         self
     }
@@ -793,7 +822,12 @@ impl CxxQtBuilder {
         header_dir: impl AsRef<Path>,
         include_prefix: &str,
     ) {
-        for files in generate_cxxqt_cpp_files(&self.rust_sources, &header_dir, include_prefix) {
+        for files in generate_cxxqt_cpp_files(
+            &self.rust_sources,
+            &header_dir,
+            include_prefix,
+            self.content_key.is_none(),
+        ) {
             self.cpp_files.push(files.plain_cpp.into());
             if let (Some(qobject), Some(qobject_header)) = (files.qobject, files.qobject_header) {
                 self.cpp_files.push(qobject.into());
@@ -961,7 +995,7 @@ impl CxxQtBuilder {
 
             // If any of the files inside the qml module change, then trigger a rerun
             for file in qml_module.qml_files {
-                println!("cargo::rerun-if-changed={}", file.get_path().display());
+                self.rerun_if_changed(file.get_path());
             }
 
             // Export the .qmltypes and qmldir files into a stable path, so that tools like
@@ -1210,7 +1244,7 @@ extern "C" bool {init_fun}() {{
             .map(|qrc_file| {
                 // Also ensure that each of the files in the qrc can cause a change
                 for qrc_inner_file in qtbuild.rcc().list(qrc_file) {
-                    println!("cargo::rerun-if-changed={}", qrc_inner_file.display());
+                    self.rerun_if_changed(&qrc_inner_file);
                 }
                 // We need to link this using an object file or +whole-achive, the static initializer of
                 // the qrc file isn't lost.
@@ -1297,7 +1331,7 @@ extern "C" bool {init_fun}() {{
                     MAX_INCLUDE_DEPTH,
                     // Emit rerun-if-changed for this directory as it is be part of the crate root it
                     // should not contain any generated files which may cause unwanted reruns.
-                    true,
+                    self.content_key.is_none(),
                 );
             }
             for include_dir in &self.additional_include_dirs {
